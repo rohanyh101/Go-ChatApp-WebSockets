@@ -1,14 +1,14 @@
 package main
 
 import (
-	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 )
 
 func initFrontEnd(w http.ResponseWriter, r *http.Request) {
-	log.Println(r.URL)
+	// log.Println(r.URL)
 
 	if r.URL.Path != "/" {
 		http.Error(w, "Not found", http.StatusNotFound)
@@ -20,27 +20,27 @@ func initFrontEnd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fs := http.FileServer(http.Dir("./frontend"))
+	fs := http.FileServer(http.Dir("./public"))
+
 	fs.ServeHTTP(w, r)
 }
 
 func main() {
+	port := 8080
+	manager := NewManager()
+	mux := http.NewServeMux()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	manager := NewManager(ctx)
-
-	http.HandleFunc("/", initFrontEnd)
-	http.HandleFunc("/ws", manager.ServeWS)
-	http.HandleFunc("/login", manager.loginHandler)
+	mux.HandleFunc("/", initFrontEnd)
+	mux.HandleFunc("/ws", manager.serveWS)
 
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              fmt.Sprintf(":%d", port),
 		ReadHeaderTimeout: 3 * time.Second,
+		WriteTimeout:      3 * time.Second,
+		Handler:           mux,
 	}
 
-	log.Println("Server started on port: 8080")
+	log.Printf("server running on port: %d", port)
 	err := server.ListenAndServe()
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)

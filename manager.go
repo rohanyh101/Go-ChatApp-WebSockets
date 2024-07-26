@@ -14,10 +14,10 @@ import (
 )
 
 var (
-	webSocketUpgrader = websocket.Upgrader{
-		CheckOrigin:     checkOrigin,
+	websocketUpgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
+		CheckOrigin:     checkOrigin,
 	}
 )
 
@@ -34,7 +34,7 @@ func NewManager(ctx context.Context) *Manager {
 	m := &Manager{
 		clients:  make(ClientList),
 		handlers: make(map[string]EventHandler),
-		otps:     NewRetantionMap(ctx, 5*time.Second),
+		otps:     NewRetentionMap(ctx, 5*time.Second),
 	}
 
 	m.setupEventHandlers()
@@ -43,79 +43,96 @@ func NewManager(ctx context.Context) *Manager {
 
 func (m *Manager) setupEventHandlers() {
 	m.handlers[EventSendMessage] = SendMessage
+	m.handlers[EventChangeChatRoom] = ChangeChatRoomHandler
 }
 
-func SendMessage(event Event, c *Client) error {
-	fmt.Println(event)
+func ChangeChatRoomHandler(e Event, c *client) error {
+	var chatEvent ChangeChatRoomEvent
+
+	if err := json.Unmarshal(e.Payload, &chatEvent); err != nil {
+		return fmt.Errorf("bad payload request: %v", err)
+	}
+
+	c.chatroom = chatEvent.Name
+
 	return nil
 }
 
-func (m *Manager) routeEvent(event Event, c *Client) error {
-	if handler, ok := m.handlers[event.Type]; ok {
-		if err := handler(event, c); err != nil {
-			return err
-		}
-		return nil
+func SendMessage(e Event, c *client) error {
+	var chatEvent SendMessageEvent
+
+	if err := json.Unmarshal(e.Payload, &chatEvent); err != nil {
+		return fmt.Errorf("bad payload request: %v", err)
 	}
 
-	return errors.New("there is no sush event type")
+	var broadcastEvent NewMessageEvent
+
+	broadcastEvent.Sent = time.Now()
+	broadcastEvent.Message = chatEvent.Message
+	broadcastEvent.From = chatEvent.From
+
+	data, err := json.Marshal(broadcastEvent)
+	if err != nil {
+		return fmt.Errorf("error marshalling broadcast event: %v", err)
+	}
+
+	outgoingEvent := Event{
+		Payload: data,
+		Type:    EventNewMessage,
+	}
+
+	for client := range c.manager.clients {
+		if client.chatroom == c.chatroom {
+			client.egress <- outgoingEvent
+		}
+	}
+
+	return nil
 }
 
-func (m *Manager) ServeWS(w http.ResponseWriter, r *http.Request) {
+func (m *Manager) routeEvent(e Event, c *client) error {
+	if handler, ok := m.handlers[e.Type]; ok {
+		if err := handler(e, c); err != nil {
+			return err
+		}
 
-	otp := r.URL.Query().Get("otp")
-	if otp == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
+		return nil
+	} else {
+		return errors.New("no handler found for event type")
 	}
-
-	if !m.otps.VerifyOTP(otp) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	log.Println("new connection...")
-
-	// update regular HTTP connection to a websocket connection...
-	conn, err := webSocketUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("upgrade:", err)
-		return
-	}
-
-	client := NewClient(conn, m)
-	m.addClient(client)
-
-	// client processes...
-	go client.readMessages()
-	go client.writeMessages()
 }
 
 func (m *Manager) loginHandler(w http.ResponseWriter, r *http.Request) {
-	type userloginRequest struct {
+	// this is inline struct declaration for the request body
+	type userLoginRequest struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 
-	var req userloginRequest
+	var req userLoginRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	if req.Username == "rohan" && req.Password == "demo" {
+	// check if the user is authenticated or not...
+	if req.Username == "root" && req.Password == "root" {
 		type response struct {
 			OTP string `json:"otp"`
 		}
 
 		otp := m.otps.NewOTP()
-		res := response{
+
+		resp := response{
 			OTP: otp.Key,
 		}
 
-		data, err := json.Marshal(res)
+		data, err := json.Marshal(resp)
 		if err != nil {
-			log.Fatal("error marshalling response: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -126,30 +143,65 @@ func (m *Manager) loginHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusUnauthorized)
 }
 
-func (m *Manager) addClient(client *Client) {
-	m.Lock()
-	defer m.Unlock()
+func (m *Manager) serveWS(w http.ResponseWriter, r *http.Request) {
+	otp := r.URL.Query().Get("otp")
+	if otp == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
-	m.clients[client] = true
+	if !m.otps.VerifyOTP(otp) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	log.Println("Websocket connection established")
+
+	// upgrade regular HTTP connection to a websocket connection
+	conn, err := websocketUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	client := NewClient(conn, m)
+
+	m.addClient(client)
+
+	// strat 2 go routines to read and write messages
+	// read messages from the client
+	go client.readMessages()
+
+	// write messages to the client
+	go client.writeMessages()
 }
 
-func (m *Manager) removeClient(client *Client) {
+func (m *Manager) addClient(c *client) {
 	m.Lock()
 	defer m.Unlock()
 
-	if _, ok := m.clients[client]; ok {
-		client.conn.Close()
-		delete(m.clients, client)
+	if _, ok := m.clients[c]; !ok {
+		m.clients[c] = true
 	}
 }
 
+func (m *Manager) removeClient(c *client) {
+	m.Lock()
+	defer m.Unlock()
+
+	if _, ok := m.clients[c]; ok {
+		c.connection.Close()
+		delete(m.clients, c)
+	}
+}
+
+// we are allowing user to our app from certain domains to avoid CSRF attacks...
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
 	switch origin {
-	case "http://localhost:8080":
+	case "https://localhost:8080":
 		return true
-
 	default:
 		return false
 	}

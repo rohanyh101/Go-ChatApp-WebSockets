@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -26,12 +27,16 @@ func initFrontEnd(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	port := 8080
-	manager := NewManager()
+	manager := NewManager(ctx)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", initFrontEnd)
 	mux.HandleFunc("/ws", manager.serveWS)
+	mux.HandleFunc("/login", manager.loginHandler)
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
@@ -41,7 +46,7 @@ func main() {
 	}
 
 	log.Printf("server running on port: %d", port)
-	err := server.ListenAndServe()
+	err := server.ListenAndServeTLS("server.crt", "server.key")
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
